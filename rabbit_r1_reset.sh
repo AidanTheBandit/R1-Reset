@@ -80,15 +80,15 @@ install_system_deps() {
         ubuntu|debian)
             print_status "Installing dependencies for Ubuntu/Debian..."
             sudo apt update
-            sudo apt install -y python3 python3-pip python3-venv git libusb-1.0-0 libfuse2 curl wget build-essential
+            sudo apt install -y python3 python3-pip python3-venv git libusb-1.0-0 libfuse2 curl wget build-essential pkg-config libssl-dev
             ;;
         arch|manjaro)
             print_status "Installing dependencies for Arch Linux..."
-            sudo pacman -S --noconfirm python python-pip python-pipenv git libusb fuse2 curl wget base-devel
+            sudo pacman -S --noconfirm python python-pip python-pipenv git libusb fuse2 curl wget base-devel openssl pkg-config
             ;;
         fedora|rhel|centos)
             print_status "Installing dependencies for Fedora/RHEL..."
-            sudo dnf install -y python3 python3-pip git libusb1 fuse curl wget gcc gcc-c++ make
+            sudo dnf install -y python3 python3-pip git libusb1 fuse curl wget gcc gcc-c++ make openssl-devel pkg-config
             ;;
         macos)
             print_status "Installing dependencies for macOS..."
@@ -96,7 +96,22 @@ install_system_deps() {
                 print_status "Installing Homebrew..."
                 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
             fi
-            brew install macfuse openssl python@3.9 git
+            brew install macfuse openssl@3 python@3.9 git cmake pkg-config
+            
+            # Set OpenSSL environment variables for macOS
+            print_status "Setting OpenSSL environment variables..."
+            if [[ $(uname -m) == "arm64" ]]; then
+                # For Apple Silicon Macs
+                export LDFLAGS="-L/opt/homebrew/opt/openssl@3/lib"
+                export CFLAGS="-I/opt/homebrew/opt/openssl@3/include"
+                export CPPFLAGS="-I/opt/homebrew/opt/openssl@3/include"
+            else
+                # For Intel Macs
+                export LDFLAGS="-L/usr/local/opt/openssl@3/lib"
+                export CFLAGS="-I/usr/local/opt/openssl@3/include"
+                export CPPFLAGS="-I/usr/local/opt/openssl@3/include"
+            fi
+            export PYTHONIOENCODING=utf-8
             ;;
         windows)
             print_warning "Windows detected. Please ensure the following are installed:"
@@ -161,7 +176,7 @@ clone_mtkclient() {
     fi
 }
 
-# Function to setup Python virtual environment
+# Function to setup Python virtual environment with fixes for known issues
 setup_venv() {
     print_step "Setting up Python virtual environment..."
     
@@ -176,9 +191,30 @@ setup_venv() {
     # Upgrade pip
     pip install --upgrade pip
     
-    # Install MTKClient dependencies
+    # Install MTKClient dependencies with fixes for common issues
     cd "$MTKCLIENT_DIR"
-    pip install -r requirements.txt
+    
+    # For macOS, we handle problematic packages separately
+    if [[ "$OS" == "macos" ]]; then
+        print_status "Installing dependencies with special handling for macOS..."
+        
+        # Install scrypt first with OpenSSL variables set
+        pip install scrypt
+        
+        # Skip problematic packages and install alternatives
+        grep -v "unicorn\|pyside6" requirements.txt > fixed_requirements.txt
+        pip install -r fixed_requirements.txt
+        
+        # Install keystone without dependencies
+        pip install --no-deps keystone
+        
+        print_warning "Skipped problematic packages: unicorn, pyside6"
+    else
+        # For other operating systems, try installing normally
+        pip install -r requirements.txt
+    fi
+    
+    # Install MTKClient
     pip install .
     
     # Set MTK command for virtual environment
@@ -290,7 +326,7 @@ auto_setup() {
 show_banner() {
     echo -e "${BLUE}"
     echo "========================================================"
-    echo "    Rabbit R1 Auto-Setup Factory Reset Tool v2.0"
+    echo "    Rabbit R1 Auto-Setup Factory Reset Tool v2.1"
     echo "         Automatic MTKClient Installation"
     echo "========================================================"
     echo -e "${NC}"
@@ -407,6 +443,7 @@ post_reset_instructions() {
             echo "• To use MTKClient again: source $VENV_DIR/bin/activate"
         fi
         echo "• You can run this script again anytime"
+        echo "• To clean up installation: $0 --cleanup"
     fi
 }
 
@@ -434,13 +471,80 @@ handle_error() {
     echo ""
     echo "For more help, visit: https://github.com/bkerler/mtkclient"
     echo "Or use the MTK Live DVD: https://androidfilehost.com/?fid=15664248565197184488"
+    echo ""
+    echo "To clean up the installation: $0 --cleanup"
 }
 
 # Function to cleanup on exit
 cleanup() {
-    if [ -f "$VENV_DIR/bin/activate" ]; then
+    if [ -n "$VIRTUAL_ENV" ]; then
         deactivate 2>/dev/null || true
     fi
+}
+
+# Function for complete cleanup mode
+perform_cleanup() {
+    show_banner
+    print_step "Starting cleanup mode..."
+    
+    # Check if we're on Live DVD
+    if [ "$IS_LIVE_DVD" = true ]; then
+        print_warning "Running on MTK Live DVD - cleanup not needed"
+        exit 0
+    fi
+    
+    echo -e "${YELLOW}"
+    echo "⚠️  WARNING: CLEANUP MODE ⚠️"
+    echo "=============================="
+    echo "This will remove:"
+    echo "• MTKClient directory: $MTKCLIENT_DIR"
+    echo "• Python virtual environment: $VENV_DIR"
+    echo -e "${NC}"
+    
+    read -p "Do you want to proceed with cleanup? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        print_status "Cleanup cancelled by user"
+        exit 0
+    fi
+    
+    # Deactivate virtual environment if active
+    if [ -n "$VIRTUAL_ENV" ]; then
+        print_status "Deactivating virtual environment..."
+        deactivate 2>/dev/null || true
+    fi
+    
+    # Remove virtual environment
+    if [ -d "$VENV_DIR" ]; then
+        print_status "Removing virtual environment: $VENV_DIR"
+        rm -rf "$VENV_DIR"
+    fi
+    
+    # Remove MTKClient directory
+    if [ -d "$MTKCLIENT_DIR" ]; then
+        print_status "Removing MTKClient directory: $MTKCLIENT_DIR"
+        rm -rf "$MTKCLIENT_DIR"
+    fi
+    
+    # Remove udev rules on Linux
+    if [[ "$OS" == "ubuntu" || "$OS" == "debian" || "$OS" == "arch" || "$OS" == "fedora" ]]; then
+        print_status "Checking for udev rules to remove..."
+        if [ -f "/etc/udev/rules.d/51-edl.rules" ]; then
+            print_status "Removing udev rules..."
+            sudo rm -f /etc/udev/rules.d/51-edl.rules 2>/dev/null || true
+            sudo rm -f /etc/udev/rules.d/52-mtk.rules 2>/dev/null || true
+            sudo udevadm control -R 2>/dev/null || true
+            
+            print_warning "You may need to handle blacklist entries manually"
+            echo "To check for blacklist entries: cat /etc/modprobe.d/blacklist.conf"
+        fi
+    fi
+    
+    print_success "Cleanup completed successfully!"
+    echo ""
+    echo "All MTKClient files and environments have been removed."
+    echo "If you installed any system packages specifically for this tool,"
+    echo "you'll need to remove them manually using your system's package manager."
 }
 
 # Function to check internet connectivity
@@ -466,6 +570,13 @@ check_internet() {
 
 # Main execution function
 main() {
+    # Check for cleanup mode
+    if [[ "$1" == "--cleanup" ]]; then
+        detect_system
+        perform_cleanup
+        exit 0
+    fi
+    
     show_banner
     detect_system
     show_warnings
@@ -495,5 +606,5 @@ if [ -z "$BASH_VERSION" ]; then
     exit 1
 fi
 
-# Run main function
+# Run main function with arguments
 main "$@"
